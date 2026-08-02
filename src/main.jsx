@@ -3,7 +3,8 @@ import { AnimatePresence, motion } from "framer-motion";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
-const STORAGE_KEY = "money-hq-premium-v2";
+const STORAGE_KEY = "money-hq-premium-v3";
+const PREVIOUS_STORAGE_KEY = "money-hq-premium-v2";
 const LEGACY_KEY = "money-hq-data-v1";
 
 const CATEGORIES = [
@@ -20,6 +21,7 @@ const NAV_ITEMS = [
   ["analytics", "◔", "Analytics"],
   ["goals", "◎", "Goals"],
   ["activity", "≡", "Activity"],
+  ["vaults", "💰", "Vault"],
 ];
 
 const currency = new Intl.NumberFormat("en-US", {
@@ -36,7 +38,14 @@ const shortCurrency = new Intl.NumberFormat("en-US", {
 
 const formatMoney = (value) => currency.format(Number(value || 0));
 const formatShortMoney = (value) => shortCurrency.format(Number(value || 0));
-const safeNumber = (value) => Math.max(0, Number(value) || 0);
+
+const safeNumber = (value) => {
+  const parsed = Number(value);
+
+  return Number.isFinite(parsed)
+    ? Math.max(0, Math.round(parsed * 100) / 100)
+    : 0;
+};
 
 const makeId = () =>
   globalThis.crypto?.randomUUID?.() ||
@@ -45,6 +54,7 @@ const makeId = () =>
 function dateKey(value = new Date()) {
   const date = value instanceof Date ? value : new Date(value);
   const offset = date.getTimezoneOffset() * 60000;
+
   return new Date(date.getTime() - offset).toISOString().slice(0, 10);
 }
 
@@ -68,15 +78,35 @@ function normalizeGoal(goal, index) {
   };
 }
 
+function normalizeVault(vault, index) {
+  return {
+    id: vault?.id || `vault-${index}-${makeId()}`,
+    name: String(vault?.name || "Untitled Vault").slice(0, 60),
+    target: Math.max(1, safeNumber(vault?.target || 1)),
+    saved: safeNumber(vault?.saved),
+    icon: vault?.icon || "🔒",
+    createdAt: vault?.createdAt || new Date().toISOString(),
+    completedAt: vault?.completedAt || null,
+  };
+}
+
 function normalizeTransaction(transaction, index) {
   const direction = Number(transaction?.direction) >= 0 ? 1 : -1;
-  const type =
+
+  const rawType =
     transaction?.type ||
     (direction > 0
       ? "income"
       : transaction?.category === "goal"
         ? "saving"
         : "expense");
+
+  const type =
+    rawType === "vault"
+      ? direction > 0
+        ? "vault_withdrawal"
+        : "vault_deposit"
+      : rawType;
 
   return {
     id: transaction?.id || `tx-${index}-${makeId()}`,
@@ -86,6 +116,7 @@ function normalizeTransaction(transaction, index) {
     type,
     category:
       transaction?.category || (type === "income" ? "income" : "other"),
+    vaultId: transaction?.vaultId || null,
     icon:
       transaction?.icon ||
       transaction?.emoji ||
@@ -98,20 +129,31 @@ function loadVault() {
   const fallback = {
     balance: 0,
     goals: [],
+    vaults: [],
     transactions: [],
     selectedCategory: "food",
     streak: {
       count: 1,
       lastActiveDate: dateKey(),
     },
+    savingStreak: {
+      count: 0,
+      lastSavedDate: null,
+    },
+    achievementUnlocks: {},
+    vaultStats: {
+      totalEverLocked: 0,
+    },
   };
 
   const current = readStorage(STORAGE_KEY);
+  const previous = readStorage(PREVIOUS_STORAGE_KEY);
   const legacy = readStorage(LEGACY_KEY);
   const oldGoals = readStorage("goals", []);
 
   const source =
     current ||
+    previous ||
     legacy || {
       ...fallback,
       balance: safeNumber(localStorage.getItem("money")),
@@ -145,9 +187,14 @@ function loadVault() {
     lastActiveDate: currentDate,
   };
 
+  const sourceSavingStreak = source.savingStreak || {};
+
   return {
     balance: safeNumber(source.balance),
     goals: legacyGoals.map(normalizeGoal),
+    vaults: Array.isArray(source.vaults)
+      ? source.vaults.map(normalizeVault)
+      : [],
     transactions: Array.isArray(source.transactions)
       ? source.transactions.map(normalizeTransaction)
       : [],
@@ -157,6 +204,21 @@ function loadVault() {
       ? source.selectedCategory
       : "food",
     streak,
+    savingStreak: {
+      count: safeNumber(sourceSavingStreak.count),
+      lastSavedDate:
+        typeof sourceSavingStreak.lastSavedDate === "string"
+          ? sourceSavingStreak.lastSavedDate
+          : null,
+    },
+    achievementUnlocks:
+      source.achievementUnlocks &&
+      typeof source.achievementUnlocks === "object"
+        ? source.achievementUnlocks
+        : {},
+    vaultStats: {
+      totalEverLocked: safeNumber(source.vaultStats?.totalEverLocked),
+    },
   };
 }
 
@@ -188,6 +250,7 @@ function createTransaction({
   type,
   category,
   icon,
+  vaultId = null,
 }) {
   return {
     id: makeId(),
@@ -197,16 +260,64 @@ function createTransaction({
     type,
     category,
     icon,
+    vaultId,
     createdAt: new Date().toISOString(),
   };
 }
 
+function advanceSavingStreak(currentStreak) {
+  const today = dateKey();
+  const previousDate = currentStreak?.lastSavedDate;
+
+  if (previousDate === today) {
+    return currentStreak || {
+      count: 1,
+      lastSavedDate: today,
+    };
+  }
+
+  if (!previousDate) {
+    return {
+      count: 1,
+      lastSavedDate: today,
+    };
+  }
+
+  const daysSinceLastSave = Math.round(
+    (new Date(`${today}T00:00:00`) -
+      new Date(`${previousDate}T00:00:00`)) /
+      86400000,
+  );
+
+  return {
+    count:
+      daysSinceLastSave === 1
+        ? safeNumber(currentStreak.count) + 1
+        : 1,
+    lastSavedDate: today,
+  };
+}
+
+function addAchievement(unlocks, id) {
+  return unlocks?.[id]
+    ? unlocks
+    : {
+        ...(unlocks || {}),
+        [id]: new Date().toISOString(),
+      };
+}
+
 function Modal({ title, subtitle, children, onClose }) {
   useEffect(() => {
-    const closeOnEscape = (event) => event.key === "Escape" && onClose();
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+
     document.addEventListener("keydown", closeOnEscape);
 
-    return () => document.removeEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+    };
   }, [onClose]);
 
   return (
@@ -257,6 +368,7 @@ function AmountInput({ id, label, value, onChange, placeholder = "$0.00" }) {
 
       <div className="money-input">
         <span>$</span>
+
         <input
           id={id}
           inputMode="decimal"
@@ -278,13 +390,26 @@ function App() {
   const [modal, setModal] = useState(null);
   const [filter, setFilter] = useState("all");
   const [toast, setToast] = useState(null);
+  const [fundingVaultId, setFundingVaultId] = useState(null);
+  const [vaultCelebration, setVaultCelebration] = useState(null);
+
   const toastTimer = useRef(null);
+  const vaultAnimationTimer = useRef(null);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(vault));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(vault));
+    } catch {
+      // The app continues working in memory if browser storage is unavailable.
+    }
   }, [vault]);
 
-  useEffect(() => () => clearTimeout(toastTimer.current), []);
+  useEffect(() => {
+    return () => {
+      clearTimeout(toastTimer.current);
+      clearTimeout(vaultAnimationTimer.current);
+    };
+  }, []);
 
   const selectedCategory = categoryFor(vault.selectedCategory);
 
@@ -309,9 +434,19 @@ function App() {
     [vault.goals],
   );
 
+  const lockedInVaults = useMemo(
+    () => vault.vaults.reduce((sum, item) => sum + item.saved, 0),
+    [vault.vaults],
+  );
+
   const totalGoalTarget = useMemo(
     () => vault.goals.reduce((sum, goal) => sum + goal.target, 0),
     [vault.goals],
+  );
+
+  const totalVaultTarget = useMemo(
+    () => vault.vaults.reduce((sum, item) => sum + item.target, 0),
+    [vault.vaults],
   );
 
   const savingsRate =
@@ -346,9 +481,18 @@ function App() {
   const recentTransactions = useMemo(
     () =>
       vault.transactions
-        .filter(
-          (transaction) => filter === "all" || transaction.type === filter,
-        )
+        .filter((transaction) => {
+          if (filter === "all") return true;
+
+          if (filter === "vault") {
+            return (
+              transaction.type === "vault_deposit" ||
+              transaction.type === "vault_withdrawal"
+            );
+          }
+
+          return transaction.type === filter;
+        })
         .slice(0, 8),
     [vault.transactions, filter],
   );
@@ -356,6 +500,32 @@ function App() {
   const completedGoals = vault.goals.filter(
     (goal) => goal.saved >= goal.target,
   ).length;
+
+  const completedVaults = vault.vaults.filter(
+    (item) => item.saved >= item.target,
+  ).length;
+
+  const vaultAchievementState = {
+    firstVault:
+      Boolean(vault.achievementUnlocks.firstVault) ||
+      vault.vaults.length >= 1,
+    firstHundredLocked:
+      Boolean(vault.achievementUnlocks.firstHundredLocked) ||
+      lockedInVaults >= 100,
+    firstCompletedVault:
+      Boolean(vault.achievementUnlocks.firstCompletedVault) ||
+      completedVaults >= 1,
+    savingStreak7:
+      Boolean(vault.achievementUnlocks.savingStreak7) ||
+      vault.savingStreak.count >= 7,
+    savingStreak30:
+      Boolean(vault.achievementUnlocks.savingStreak30) ||
+      vault.savingStreak.count >= 30,
+    bigSaver:
+      Boolean(vault.achievementUnlocks.bigSaver) ||
+      vault.vaultStats.totalEverLocked >= 1000 ||
+      lockedInVaults >= 1000,
+  };
 
   const categoryTotals = useMemo(() => {
     const sums = Object.fromEntries(
@@ -385,7 +555,8 @@ function App() {
 
       const amount = vault.transactions
         .filter(
-          (item) => item.type === "expense" && dateKey(item.createdAt) === key,
+          (item) =>
+            item.type === "expense" && dateKey(item.createdAt) === key,
         )
         .reduce((sum, item) => sum + item.amount, 0);
 
@@ -407,7 +578,10 @@ function App() {
   );
 
   const donutStops = useMemo(() => {
-    const total = categoryTotals.reduce((sum, item) => sum + item.amount, 0);
+    const total = categoryTotals.reduce(
+      (sum, item) => sum + item.amount,
+      0,
+    );
 
     if (!total) return "#1d2940 0deg 360deg";
 
@@ -447,6 +621,42 @@ function App() {
       title: "Tracker",
       text: `${vault.transactions.length} money moves`,
       unlocked: vault.transactions.length >= 5,
+    },
+    {
+      icon: "🔐",
+      title: "First Vault Created",
+      text: "Open your first protected Vault",
+      unlocked: vaultAchievementState.firstVault,
+    },
+    {
+      icon: "💰",
+      title: "First $100 Locked",
+      text: `${formatMoney(lockedInVaults)} safely locked`,
+      unlocked: vaultAchievementState.firstHundredLocked,
+    },
+    {
+      icon: "🏅",
+      title: "First Completed Vault",
+      text: `${completedVaults} Vaults fully funded`,
+      unlocked: vaultAchievementState.firstCompletedVault,
+    },
+    {
+      icon: "7",
+      title: "7 Day Saving Streak",
+      text: `${vault.savingStreak.count} saving days`,
+      unlocked: vaultAchievementState.savingStreak7,
+    },
+    {
+      icon: "30",
+      title: "30 Day Saving Streak",
+      text: `${vault.savingStreak.count} saving days`,
+      unlocked: vaultAchievementState.savingStreak30,
+    },
+    {
+      icon: "✦",
+      title: "Big Saver",
+      text: `${formatMoney(vault.vaultStats.totalEverLocked)} locked over time`,
+      unlocked: vaultAchievementState.bigSaver,
     },
   ];
 
@@ -573,7 +783,6 @@ function App() {
     }));
 
     setModal(null);
-
     showToast(
       "Goal created",
       `${name.trim()} is officially on your mission board.`,
@@ -634,6 +843,262 @@ function App() {
     );
   }
 
+  function createVault(name, target, icon) {
+    const value = safeNumber(target);
+
+    if (!name.trim() || !value) {
+      return showToast(
+        "Complete your Vault",
+        "Give it a name and a target amount.",
+        "error",
+      );
+    }
+
+    commit((current) => ({
+      ...current,
+      vaults: [
+        ...current.vaults,
+        {
+          id: makeId(),
+          name: name.trim().slice(0, 60),
+          target: value,
+          saved: 0,
+          icon,
+          createdAt: new Date().toISOString(),
+          completedAt: null,
+        },
+      ],
+      achievementUnlocks: addAchievement(
+        current.achievementUnlocks,
+        "firstVault",
+      ),
+    }));
+
+    setModal(null);
+
+    showToast(
+      "Vault opened",
+      `${name.trim()} is ready to protect your money.`,
+      "vault",
+    );
+  }
+
+  function fundVault(vaultId, amount) {
+    const value = safeNumber(amount);
+    const targetVault = vault.vaults.find((item) => item.id === vaultId);
+
+    if (!targetVault || !value) {
+      return showToast(
+        "Enter an amount",
+        "Choose how much money to lock away.",
+        "error",
+      );
+    }
+
+    if (fundingVaultId === vaultId) return;
+
+    if (value > vault.balance) {
+      return showToast(
+        "Not enough available",
+        "Add money before locking it in a Vault.",
+        "error",
+      );
+    }
+
+    const remaining = Math.max(0, targetVault.target - targetVault.saved);
+
+    if (value > remaining) {
+      return showToast(
+        "Vault target reached",
+        `This Vault only needs ${formatMoney(remaining)} more.`,
+        "error",
+      );
+    }
+
+    const completesVault =
+      targetVault.saved < targetVault.target &&
+      targetVault.saved + value >= targetVault.target;
+
+    clearTimeout(vaultAnimationTimer.current);
+    setFundingVaultId(vaultId);
+
+    commit((current) => {
+      const currentVault = current.vaults.find((item) => item.id === vaultId);
+
+      const currentRemaining = currentVault
+        ? Math.max(0, currentVault.target - currentVault.saved)
+        : 0;
+
+      if (
+        !currentVault ||
+        value > current.balance ||
+        value > currentRemaining
+      ) {
+        return current;
+      }
+
+      const savingStreak = advanceSavingStreak(current.savingStreak);
+
+      const lockedAfter =
+        current.vaults.reduce((sum, item) => sum + item.saved, 0) + value;
+
+      const totalEverLocked = current.vaultStats.totalEverLocked + value;
+
+      let achievementUnlocks = current.achievementUnlocks;
+
+      if (lockedAfter >= 100) {
+        achievementUnlocks = addAchievement(
+          achievementUnlocks,
+          "firstHundredLocked",
+        );
+      }
+
+      if (completesVault) {
+        achievementUnlocks = addAchievement(
+          achievementUnlocks,
+          "firstCompletedVault",
+        );
+      }
+
+      if (savingStreak.count >= 7) {
+        achievementUnlocks = addAchievement(
+          achievementUnlocks,
+          "savingStreak7",
+        );
+      }
+
+      if (savingStreak.count >= 30) {
+        achievementUnlocks = addAchievement(
+          achievementUnlocks,
+          "savingStreak30",
+        );
+      }
+
+      if (totalEverLocked >= 1000) {
+        achievementUnlocks = addAchievement(
+          achievementUnlocks,
+          "bigSaver",
+        );
+      }
+
+      return {
+        ...current,
+        balance: current.balance - value,
+        vaults: current.vaults.map((item) =>
+          item.id === vaultId
+            ? {
+                ...item,
+                saved: item.saved + value,
+                completedAt: completesVault
+                  ? new Date().toISOString()
+                  : item.completedAt,
+              }
+            : item,
+        ),
+        savingStreak,
+        vaultStats: {
+          totalEverLocked,
+        },
+        achievementUnlocks,
+        transactions: [
+          createTransaction({
+            label: `Locked in ${currentVault.name}`,
+            amount: value,
+            direction: -1,
+            type: "vault_deposit",
+            category: "vault",
+            icon: currentVault.icon,
+            vaultId,
+          }),
+          ...current.transactions,
+        ].slice(0, 150),
+      };
+    });
+
+    vaultAnimationTimer.current = setTimeout(
+      () => setFundingVaultId(null),
+      1500,
+    );
+
+    if (completesVault) {
+      setVaultCelebration(targetVault);
+
+      showToast(
+        "Vault completed",
+        `${targetVault.name} is fully locked and protected.`,
+        "vault",
+      );
+    } else {
+      showToast(
+        "Money locked",
+        `${formatMoney(value)} is now protected in ${targetVault.name}.`,
+        "vault",
+      );
+    }
+  }
+
+  function withdrawFromVault(vaultId, amount) {
+    const value = safeNumber(amount);
+    const targetVault = vault.vaults.find((item) => item.id === vaultId);
+
+    if (!targetVault || !value) {
+      return showToast(
+        "Enter an amount",
+        "Choose how much money to withdraw.",
+        "error",
+      );
+    }
+
+    if (value > targetVault.saved) {
+      return showToast(
+        "Not enough locked",
+        `${targetVault.name} only has ${formatMoney(targetVault.saved)} available.`,
+        "error",
+      );
+    }
+
+    commit((current) => {
+      const currentVault = current.vaults.find((item) => item.id === vaultId);
+
+      if (!currentVault || value > currentVault.saved) return current;
+
+      return {
+        ...current,
+        balance: current.balance + value,
+        vaults: current.vaults.map((item) =>
+          item.id === vaultId
+            ? {
+                ...item,
+                saved: item.saved - value,
+                completedAt:
+                  item.saved - value >= item.target
+                    ? item.completedAt
+                    : null,
+              }
+            : item,
+        ),
+        transactions: [
+          createTransaction({
+            label: `Withdrew from ${currentVault.name}`,
+            amount: value,
+            direction: 1,
+            type: "vault_withdrawal",
+            category: "vault",
+            icon: currentVault.icon,
+            vaultId,
+          }),
+          ...current.transactions,
+        ].slice(0, 150),
+      };
+    });
+
+    showToast(
+      "Funds unlocked",
+      `${formatMoney(value)} returned to your available balance.`,
+      "vault",
+    );
+  }
+
   function setCategory(categoryId) {
     commit((current) => ({
       ...current,
@@ -644,12 +1109,10 @@ function App() {
   function navigate(section) {
     setActiveNav(section);
 
-    document
-      .getElementById(`${section}-section`)
-      ?.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
+    document.getElementById(`${section}-section`)?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
   }
 
   return (
@@ -668,7 +1131,9 @@ function App() {
           {NAV_ITEMS.map(([id, icon, label]) => (
             <button
               key={id}
-              className={activeNav === id ? "nav-item active" : "nav-item"}
+              className={`nav-item ${activeNav === id ? "active" : ""} ${
+                id === "vaults" ? "vault-nav" : ""
+              }`}
               onClick={() => navigate(id)}
             >
               <span>{icon}</span>
@@ -972,6 +1437,119 @@ function App() {
           )}
         </section>
 
+        <section id="vaults-section" className="section-anchor vault-panel">
+          <motion.article
+            className="vault-hero"
+            initial={{ opacity: 0, y: 16 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, amount: 0.2 }}
+          >
+            <div className="vault-hero-light one" />
+            <div className="vault-hero-light two" />
+
+            <div className="vault-hero-top">
+              <div>
+                <p className="eyebrow vault-eyebrow">THE VAULT</p>
+
+                <h2>
+                  Protected savings, built for your next big move.
+                </h2>
+
+                <p>
+                  Your Vault money stays separate from your everyday balance
+                  until you decide to unlock it.
+                </p>
+              </div>
+
+              <span className="vault-emblem">🔐</span>
+            </div>
+
+            <div className="vault-overview">
+              <div>
+                <small>Total locked</small>
+                <strong>{formatMoney(lockedInVaults)}</strong>
+              </div>
+
+              <div>
+                <small>Open Vaults</small>
+                <strong>{vault.vaults.length}</strong>
+              </div>
+
+              <div>
+                <small>Completed</small>
+                <strong>{completedVaults}</strong>
+              </div>
+
+              <div>
+                <small>Vault progress</small>
+                <strong>
+                  {totalVaultTarget
+                    ? `${Math.round(
+                        (lockedInVaults / totalVaultTarget) * 100,
+                      )}%`
+                    : "0%"}
+                </strong>
+              </div>
+            </div>
+
+            <button
+              className="vault-create-button"
+              onClick={() => setModal("vault")}
+            >
+              + Open a Vault
+            </button>
+          </motion.article>
+
+          <article className="panel vault-library">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow vault-eyebrow">
+                  YOUR PRIVATE RESERVES
+                </p>
+                <h2>Vaults</h2>
+              </div>
+
+              <button
+                className="text-button vault-text-button"
+                onClick={() => setModal("vault")}
+              >
+                + Create Vault
+              </button>
+            </div>
+
+            {vault.vaults.length === 0 ? (
+              <div className="empty-vaults">
+                <div className="empty-vault-lock">🔒</div>
+                <h3>Open your first Vault.</h3>
+                <p>
+                  Set money aside for the things you want to protect from
+                  everyday spending.
+                </p>
+
+                <button
+                  className="vault-create-button"
+                  onClick={() => setModal("vault")}
+                >
+                  Create a Vault
+                </button>
+              </div>
+            ) : (
+              <div className="vault-grid">
+                {vault.vaults.map((item) => (
+                  <VaultCard
+                    key={item.id}
+                    vault={item}
+                    availableBalance={vault.balance}
+                    isFunding={fundingVaultId === item.id}
+                    onFund={fundVault}
+                    onWithdraw={withdrawFromVault}
+                  />
+                ))}
+              </div>
+            )}
+          </article>
+        </section>
+
         <section id="activity-section" className="lower-grid section-anchor">
           <article className="panel activity-panel">
             <div className="panel-header">
@@ -986,6 +1564,7 @@ function App() {
                   ["income", "Income"],
                   ["expense", "Spending"],
                   ["saving", "Goals"],
+                  ["vault", "Vault"],
                 ].map(([id, label]) => (
                   <button
                     key={id}
@@ -1003,8 +1582,8 @@ function App() {
                 <span>⌁</span>
                 <h3>Your story starts here.</h3>
                 <p>
-                  Every add, expense, and goal move will appear in your private
-                  ledger.
+                  Every add, expense, goal move, and Vault transfer will appear
+                  in your private ledger.
                 </p>
 
                 <button
@@ -1099,7 +1678,9 @@ function App() {
         {NAV_ITEMS.map(([id, icon, label]) => (
           <button
             key={id}
-            className={activeNav === id ? "active" : ""}
+            className={`${activeNav === id ? "active" : ""} ${
+              id === "vaults" ? "vault-mobile-nav" : ""
+            }`}
             onClick={() => navigate(id)}
           >
             <span>{icon}</span>
@@ -1128,6 +1709,22 @@ function App() {
           <GoalModal
             onClose={() => setModal(null)}
             onSubmit={createGoal}
+          />
+        )}
+
+        {modal === "vault" && (
+          <VaultModal
+            onClose={() => setModal(null)}
+            onSubmit={createVault}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {vaultCelebration && (
+          <VaultCelebration
+            vault={vaultCelebration}
+            onClose={() => setVaultCelebration(null)}
           />
         )}
       </AnimatePresence>
@@ -1216,12 +1813,243 @@ function GoalCard({ goal, balance, onContribute }) {
   );
 }
 
+function VaultCard({
+  vault,
+  availableBalance,
+  isFunding,
+  onFund,
+  onWithdraw,
+}) {
+  const [amount, setAmount] = useState("");
+  const [mode, setMode] = useState("lock");
+
+  const progress = Math.min(
+    100,
+    Math.round((vault.saved / vault.target) * 100),
+  );
+
+  const completed = progress >= 100;
+
+  const created = new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(new Date(vault.createdAt));
+
+  function submit(event) {
+    event.preventDefault();
+
+    if (mode === "lock") {
+      onFund(vault.id, amount);
+    } else {
+      onWithdraw(vault.id, amount);
+    }
+
+    setAmount("");
+  }
+
+  return (
+    <motion.article
+      className={`vault-card ${completed ? "completed" : ""} ${
+        isFunding ? "funding" : ""
+      }`}
+      initial={{ opacity: 0, y: 16, scale: 0.98 }}
+      whileInView={{ opacity: 1, y: 0, scale: 1 }}
+      viewport={{ once: true, amount: 0.1 }}
+      whileHover={{ y: -5 }}
+      transition={{ type: "spring", stiffness: 280, damping: 23 }}
+    >
+      <div className="vault-card-glow" />
+
+      {isFunding && (
+        <motion.div
+          className="vault-lock-flash"
+          initial={{ opacity: 0, scale: 0.7 }}
+          animate={{
+            opacity: [0, 1, 0],
+            scale: [0.7, 1.1, 1.35],
+          }}
+          transition={{ duration: 0.85 }}
+        >
+          🔒
+        </motion.div>
+      )}
+
+      <div className="vault-card-head">
+        <span className="vault-card-icon">{vault.icon}</span>
+
+        <div>
+          <span className={completed ? "vault-state complete" : "vault-state"}>
+            {completed ? "Vault Completed" : "Locked"}
+          </span>
+
+          <small>Opened {created}</small>
+        </div>
+      </div>
+
+      <h3>{vault.name}</h3>
+
+      <div className="vault-amount">
+        <strong>{formatMoney(vault.saved)}</strong>
+        <span>/ {formatMoney(vault.target)}</span>
+      </div>
+
+      <div className="vault-progress">
+        <i style={{ width: `${progress}%` }} />
+      </div>
+
+      <div className="vault-card-meta">
+        <span>{progress}% protected</span>
+        <span>
+          {formatMoney(Math.max(0, vault.target - vault.saved))} remaining
+        </span>
+      </div>
+
+      <form className="vault-action-form" onSubmit={submit}>
+        <div className="vault-mode-switch">
+          <button
+            type="button"
+            className={mode === "lock" ? "active" : ""}
+            onClick={() => setMode("lock")}
+          >
+            Lock money
+          </button>
+
+          <button
+            type="button"
+            className={mode === "withdraw" ? "active" : ""}
+            onClick={() => setMode("withdraw")}
+          >
+            Withdraw
+          </button>
+        </div>
+
+        <div className="vault-amount-input">
+          <span>$</span>
+
+          <input
+            aria-label={`Amount to ${
+              mode === "lock" ? "lock into" : "withdraw from"
+            } ${vault.name}`}
+            inputMode="decimal"
+            type="number"
+            min="0"
+            step="0.01"
+            value={amount}
+            onChange={(event) => setAmount(event.target.value)}
+            placeholder="0.00"
+          />
+        </div>
+
+        <button
+          className="vault-action-button"
+          type="submit"
+          disabled={
+            mode === "lock"
+              ? completed || availableBalance <= 0
+              : vault.saved <= 0
+          }
+        >
+          {mode === "lock" ? "Lock securely" : "Unlock funds"}
+        </button>
+      </form>
+    </motion.article>
+  );
+}
+
+function VaultCelebration({ vault, onClose }) {
+  const particles = Array.from({ length: 18 }, (_, index) => index);
+
+  return (
+    <motion.div
+      className="vault-celebration"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Vault completed"
+      onMouseDown={onClose}
+    >
+      <div className="vault-particles" aria-hidden="true">
+        {particles.map((particle) => (
+          <motion.i
+            key={particle}
+            style={{ "--particle": particle }}
+            initial={{
+              opacity: 0,
+              x: 0,
+              y: 0,
+              scale: 0.2,
+            }}
+            animate={{
+              opacity: [0, 1, 0],
+              x: ((particle % 6) - 2.5) * 42,
+              y: -80 - (particle % 4) * 32,
+              rotate: particle * 36,
+              scale: [0.2, 1, 0.35],
+            }}
+            transition={{
+              duration: 1.35,
+              delay: particle * 0.025,
+              ease: "easeOut",
+            }}
+          />
+        ))}
+      </div>
+
+      <motion.section
+        className="vault-complete-card"
+        initial={{ opacity: 0, y: 18, scale: 0.94 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 12, scale: 0.96 }}
+        transition={{ type: "spring", stiffness: 280, damping: 22 }}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <motion.span
+          animate={{
+            rotate: [0, -8, 8, 0],
+            scale: [1, 1.13, 1],
+          }}
+          transition={{
+            duration: 1.1,
+            repeat: Infinity,
+            repeatDelay: 1.6,
+          }}
+        >
+          🏅
+        </motion.span>
+
+        <p className="eyebrow vault-eyebrow">
+          VAULT ACHIEVEMENT UNLOCKED
+        </p>
+
+        <h2>Vault Completed</h2>
+
+        <p>
+          <strong>{vault.name}</strong> is fully funded, securely locked, and
+          ready when you are.
+        </p>
+
+        <button className="vault-create-button" onClick={onClose}>
+          Securely close
+        </button>
+      </motion.section>
+    </motion.div>
+  );
+}
+
 function TransactionRow({ transaction }) {
   const isPositive = transaction.direction > 0;
+
   const category =
     transaction.type === "expense"
       ? categoryFor(transaction.category)
       : null;
+
+  const isVaultTransfer =
+    transaction.type === "vault_deposit" ||
+    transaction.type === "vault_withdrawal";
 
   return (
     <div className="transaction-row">
@@ -1231,7 +2059,9 @@ function TransactionRow({ transaction }) {
             ? "transaction-icon positive"
             : transaction.type === "saving"
               ? "transaction-icon saving"
-              : "transaction-icon"
+              : isVaultTransfer
+                ? "transaction-icon vault-transaction"
+                : "transaction-icon"
         }
       >
         {transaction.icon}
@@ -1245,7 +2075,9 @@ function TransactionRow({ transaction }) {
             ? category.label
             : transaction.type === "saving"
               ? "Goal contribution"
-              : "Income"}{" "}
+              : isVaultTransfer
+                ? "Vault transfer"
+                : "Income"}{" "}
           · {transactionDate(transaction.createdAt)}
         </span>
       </div>
@@ -1261,7 +2093,15 @@ function TransactionRow({ transaction }) {
         </strong>
 
         <span>
-          {isPositive ? "Added" : transaction.type === "saving" ? "Saved" : "Spent"}
+          {isPositive
+            ? isVaultTransfer
+              ? "Unlocked"
+              : "Added"
+            : transaction.type === "saving"
+              ? "Saved"
+              : isVaultTransfer
+                ? "Locked"
+                : "Spent"}
         </span>
       </div>
     </div>
@@ -1427,6 +2267,81 @@ function GoalModal({ onClose, onSubmit }) {
 
         <button className="primary-action full" type="submit">
           Create goal <span>✦</span>
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
+function VaultModal({ onClose, onSubmit }) {
+  const [name, setName] = useState("");
+  const [target, setTarget] = useState("");
+  const [icon, setIcon] = useState("🔒");
+
+  const icons = ["🚗", "🏠", "🎮", "✈️", "💰", "🏎️", "🔒", "💎"];
+
+  return (
+    <Modal
+      title="Open a Vault"
+      subtitle="Create a private reserve for money you want to protect."
+      onClose={onClose}
+    >
+      <form
+        className="modal-form vault-modal-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit(name, target, icon);
+        }}
+      >
+        <div className="vault-modal-seal">
+          <span>{icon}</span>
+
+          <div>
+            <small>Private reserve</small>
+            <strong>Protected by Money HQ</strong>
+          </div>
+        </div>
+
+        <label className="field" htmlFor="vault-name">
+          <span>Name your Vault</span>
+
+          <input
+            id="vault-name"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Car Fund, Emergency Fund..."
+            maxLength="60"
+            autoFocus
+          />
+        </label>
+
+        <AmountInput
+          id="vault-target"
+          label="Target amount"
+          value={target}
+          onChange={setTarget}
+        />
+
+        <fieldset className="icon-chooser vault-icon-chooser">
+          <legend>Choose a Vault icon</legend>
+
+          <div>
+            {icons.map((item) => (
+              <button
+                className={icon === item ? "active" : ""}
+                type="button"
+                key={item}
+                onClick={() => setIcon(item)}
+                aria-label={`Use ${item} as the Vault icon`}
+              >
+                {item}
+              </button>
+            ))}
+          </div>
+        </fieldset>
+
+        <button className="vault-create-button full" type="submit">
+          Open secure Vault <span>🔐</span>
         </button>
       </form>
     </Modal>
